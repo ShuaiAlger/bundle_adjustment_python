@@ -1,112 +1,253 @@
 import numpy as np
+import math
+import cv2
 
-def levmarq(f, x0, args, xtol=1e-8, ftol=1e-8, max_iter=1000):
-    """
-    Levenberg-Marquardt optimization for bundle adjustment in visual SLAM.
-    :param f: objective function to optimize
-    :param x0: initial estimate of optimization variables
-    :param args: additional arguments to pass to objective function
-    :param xtol: tolerance for change in optimization variables
-    :param ftol: tolerance for change in objective function value
-    :param max_iter: maximum number of iterations
-    :return: optimized values of optimization variables, and number of iterations
-    """
-    # initializations
-    n = x0.shape[0]
-    x = x0.copy()
-    fx, jac = f(x, *args)
-    mu = 1e-3
-    nu = 2
-    iter = 0
+np.set_printoptions(precision = 6, suppress=True)
 
-    while iter < max_iter:
-        # compute Jacobian and gradient
-        fx, jac = f(x, *args)
-        grad = jac.T @ fx
 
-        # compute approximation to Hessian
-        hessian = jac.T @ jac + mu * np.eye(n)
 
-        # solve for update
-        delta = np.linalg.solve(hessian, -grad)
-        x_new = x + delta
 
-        # compute new objective function value
-        fx_new, _ = f(x_new, *args)
 
-        # check for improvement
-        rho = (fx.dot(fx) - fx_new.dot(fx_new)) / (delta.dot(mu * delta - grad))
+def p2d_to_homo(p2d):
+    p2dh = np.concatenate([p2d, np.ones(p2d.shape[0], 1)], axis=1)
+    return p2dh
 
-        if rho > 0:
-            # accept update
-            x = x_new
-            fx = fx_new
-            mu *= max(1/3, 1 - (2 * rho - 1) ** 3)
-            nu = 2
+def rodrigues2rot(rodrigues):
+    rot = cv2.Rodrigues(rodrigues)[0]
+    return rot
+
+# def rot2rodrigues(rot):
+#     rodrigues = cv2.Rodrigues(rot)
+#     return rodrigues
+
+# class PinholeCamera:
+#     def __init__(self, params=[520.9, 521.0, 325.1, 249.7, 0, 0, 0, 0, 0]):
+        # self.fx = params[0]
+        # self.fy = params[1]
+        # self.cx = params[2]
+        # self.cy = params[3]
+        # self.k1 = params[4]
+        # self.k2 = params[5]
+        # self.p1 = params[6]
+        # self.p2 = params[7]
+        # self.k3 = params[8]
+        # self.intri = np.asarray([[ self.fx,       0, self.cx ],
+        #                          [       0, self.fy, self.cy ],
+        #                          [       0,       0,       1 ]])
+    # def proj3d_to_2d(self, p3ds):
+    #     p2dsh = self.intri @ p3ds
+    #     return p2dsh
+
+fx = 520.9
+fy = 521.0
+cx = 325.1
+cy = 249.7
+
+
+class Optimizer:
+    def __init__(self, method="lm"):
+        self.method = method
+        self.USE_LDLT = True
+        self.USE_LM = False
+
+        if method == "lm":
+            self.USE_LM = True
+        self.lam = 0.001
+
+        self.iterations = 100
+
+        self.points3d = None
+        self.points2d = None
+        self.vertex_poses = None
+
+        # self.fx = 520.9
+        # self.fy = 521.0
+        # self.cx = 325.1
+        # self.cy = 249.7
+
+    def read_data(self, p3ds, p2ds, poses):
+        self.points3d = p3ds
+        self.points2d = p2ds
+        self.vertex_poses = poses
+
+    def cal_J(self):
+        pose_num = self.vertex_poses.shape[0]
+        point_num = self.points3d.shape[0]
+        J_all = np.zeros((2*pose_num*point_num, 6*pose_num))
+        J = np.zeros((2, 6))
+        for j in range(pose_num):
+            for i in range(point_num):
+                R = self.vertex_poses[j, 0:3, 0:3]
+                t = self.vertex_poses[j, 0:3, 3]
+                # P = R @ self.points3d[i] + t
+                P = R @ self.points3d[i].T + t.T
+
+                x = P[0]
+                y = P[1]
+                z = P[2]
+
+                z2 = z * z
+                J[0, 0] = -1.0 / z * fx
+                J[0, 1] = 0
+                J[0, 2] = x / z2 * fx
+                J[0, 3] = x * y / z2 * fx
+                J[0, 4] = -(1 + (x * x / z2)) * fx
+                J[0, 5] = y / z * fx
+                J[1, 0] = 0
+                J[1, 1] = -1.0 / z * fy
+                J[1, 2] = y / z2 * fy
+                J[1, 3] = (1 + (y * y / z2)) * fy
+                J[1, 4] = -x * y / z2 * fy
+                J[1, 5] = -x / z * fy
+
+                row = 2 * j * point_num + 2 * i
+                col = 6 * j
+
+                J_all[row:row+2, col:col+6] = J
+        return J_all
+
+    def cal_reproj_err(self):
+        pose_num = self.vertex_poses.shape[0]
+        point_num = self.points3d.shape[0]
+        reproj_err = 0.0
+        ReprojErr = np.zeros((2 * pose_num * point_num, 1))
+        for j in range(pose_num):
+            for i in range(point_num):
+                R = self.vertex_poses[j, 0:3, 0:3]
+                t = self.vertex_poses[j, 0:3, 3]
+                # P = R @ self.points3d[i] + t
+                P = R @ self.points3d[i].T + t.T
+
+                x = P[0]
+                y = P[1]
+                z = P[2]
+                p_u = fx * x / z + cx
+                p_v = fy * y / z + cy
+                du = self.points2d[i, 0] - p_u
+                dv = self.points2d[i, 1] - p_v
+
+                ReprojErr[j * point_num * 2 + 2 * i] = du
+                ReprojErr[j * point_num * 2 + 2 * i + 1] = dv
+                reproj_err = reproj_err + (du*du + dv*dv)
+        if self.USE_LM:
+            return reproj_err / (pose_num * point_num), ReprojErr
         else:
-            # reject update and increase damping
-            mu *= nu
-            nu *= 2
+            return reproj_err / (pose_num * point_num), ReprojErr
 
-        # check for convergence
-        if np.linalg.norm(delta) < xtol or np.linalg.norm(fx_new) < ftol:
-            break
+    
+    def cal_se3(self, J, ReprojErr):
+        H = J.T @ J
+        if self.USE_LM:
+            H = H + self.lam * np.eye(H.shape[0])
+        if self.USE_LDLT:
+            g = -J.T @ ReprojErr
+            delta_x = np.linalg.solve(H, g)
+        else:
+            minus_b = -1.0 * ReprojErr
+            delta_x = np.linalg.inv(H) @ J.T @ minus_b
+        return delta_x
 
-        iter += 1
+    def update_se3(self, poses, delta_se3):
+        pose_num = poses.shape[0]
+        for j in range(pose_num):
+            r = delta_se3[3:6]
+            t = delta_se3[0:3]
+            rot = rodrigues2rot(r)
+            dT = np.zeros((4, 4))
+            dT[0:3, 0:3] = rot
+            dT[0:3, 3:4] = t
+            dT[3, 3] = 1
+            poses[j] = dT @ poses[j]
+        return poses
 
-    return x, iter
+    def gauss_newton(self):
+        for i in range(self.iterations):
+            print(self.vertex_poses)
+            J = self.cal_J()
+            cur_err, ReprojErr = self.cal_reproj_err()
+            print("cur_err : ", cur_err)
+            delta_se3 = self.cal_se3(J, ReprojErr)
+            if np.linalg.norm(delta_se3) < 0.00001:
+                break
+            self.vertex_poses = self.update_se3(self.vertex_poses, delta_se3)
 
-def objective_function(x, *args):
-    """
-    Example objective function for bundle adjustment in visual SLAM.
-    :param x: optimization variables
-    :param args: additional arguments
-    :return: residuals, Jacobian
-    """
-    # example implementation that computes residuals and Jacobian for a simple 3-point system
+    def levenburg(self, xtol=1e-8, ftol=1e-8):
+        mu = 1e-3
+        nu = 2
+        iter = 0
 
-    # extract additional arguments
-    observations, points = args
+        while iter < self.iterations:
+            poses = self.vertex_poses
+            
+            # compute Jacobian and gradient
+            J = self.cal_J()
+            cur_err, ReprojErr = self.cal_reproj_err()
 
-    # extract camera pose and 3D points
-    R = x[:3, :3]
-    t = x[:3, 3]
-    P = x[3:]
+            grad = J.T @ ReprojErr
 
-    # initialize residuals and Jacobian
-    res = np.zeros((observations.shape[0],))
-    jac = np.zeros((observations.shape[0], x.shape[0]))
+            # compute approximation to Hessian
+            hessian = J.T @ J + mu * np.eye(6)
 
-    # loop over observations
-    for i in range(observations.shape[0]):
-        # extract observation and corresponding 3D point
-        u, v = observations[i, :2]
-        X = points[i, :]
+            # solve for update
+            delta = np.linalg.solve(hessian, -grad)
 
-        # project 3D point into image
-        X_homo = np.concatenate((X, [1.0]))
-        x_proj = R @ X + t
-        x_proj /= x_proj[2]
+            poses = self.update_se3(poses, delta)
+            cur_err, ReprojErr_new = self.cal_reproj_err()
 
-        # compute residuals
-        res[i] = np.linalg.norm([u - x_proj[0], v - x_proj[1]])
+            # check for improvement
+            rho = (ReprojErr.dot(ReprojErr.T) - ReprojErr_new.dot(ReprojErr_new.T)).sum() / (delta.dot((mu * delta - grad).T)).sum()
 
-        # compute Jacobian wrt camera pose
-        jac_R = -np.outer(x_proj, X_homo)
-        jac_t = np.eye(3)
-        jac[i, :6] = jac_R.flatten() @ jac_t.flatten()
+            if rho > 0:
+                # accept update
+                self.vertex_poses = poses
+                ReprojErr = ReprojErr_new
+                mu *= max(1/3, 1 - (2 * rho - 1) ** 3)
+                nu = 2
+            else:
+                # reject update and increase damping
+                mu *= nu
+                nu *= 2
 
-        # compute Jacobian wrt 3D points
-        jac_X = R.T
-        jac[i, 6:] = jac_X.flatten() @ X_homo
+            # check for convergence
+            if np.linalg.norm(delta) < xtol or np.linalg.norm(ReprojErr_new) < ftol:
+                break
 
-    return res, jac
-
-# example usage
-x0 = np.zeros((9,))
-args = (observations, points)
-x_opt, iter = levmarq(objective_function, x0, args)
+            iter += 1
 
 
 
+def read_data():
+    p2dtxt = "p2d.txt"
+    p3dtxt = "p3d.txt"
+    with open(p2dtxt) as f:
+        lines = f.readlines()
+        p2ds = np.zeros((len(lines), 2))
+        for i in range(len(lines)):
+            u = lines[i].split('\n')[0].split(' ')[0]
+            v = lines[i].split('\n')[0].split(' ')[1]
+            p2ds[i, 0] = u
+            p2ds[i, 1] = v
+    with open(p3dtxt) as f:
+        lines = f.readlines()
+        p3ds = np.zeros((len(lines), 3))
+        for i in range(len(lines)):
+            x = lines[i].split('\n')[0].split(' ')[0]
+            y = lines[i].split('\n')[0].split(' ')[1]
+            z = lines[i].split('\n')[0].split(' ')[2]
+            p3ds[i, 0] = x
+            p3ds[i, 1] = y
+            p3ds[i, 2] = z
+    return p2ds, p3ds
 
+
+
+if __name__ == '__main__':
+    p2ds, p3ds = read_data()
+
+    pose = np.eye(4, 4)
+    poses = np.zeros((1, 4, 4))
+    poses[0] = pose
+
+    opt = Optimizer()
+    opt.read_data(p3ds, p2ds, poses)
+    opt.levenburg()
